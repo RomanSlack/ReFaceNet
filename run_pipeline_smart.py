@@ -24,12 +24,13 @@ DEBUG_DIR.mkdir(exist_ok=True, parents=True)
 
 RES = 512
 
-# Initialize MediaPipe with different confidence levels
-mp_face_detection = mp.solutions.face_detection.FaceDetection(min_detection_confidence=0.3)
+# Initialize MediaPipe with very low confidence for difficult cases
+mp_face_detection = mp.solutions.face_detection.FaceDetection(min_detection_confidence=0.1)
 mp_mesh = mp.solutions.face_mesh.FaceMesh(
     static_image_mode=True, 
-    min_detection_confidence=0.3,
-    min_tracking_confidence=0.3
+    min_detection_confidence=0.1,
+    min_tracking_confidence=0.1,
+    max_num_faces=1
 )
 
 def analyze_image_quality(img):
@@ -99,9 +100,13 @@ def detect_face_with_logging(img, img_path):
     return best_face['bbox'], quality_score
 
 def extract_landmarks_with_logging(img, face_bbox, img_path):
-    """Extract landmarks with detailed logging"""
+    """Extract landmarks with detailed logging and fallback methods"""
     h, w = img.shape[:2]
     
+    # Try multiple extraction methods
+    methods_tried = []
+    
+    # Method 1: Use detected face bbox
     if face_bbox:
         x, y, width, height = face_bbox
         # Expand bbox
@@ -119,38 +124,95 @@ def extract_landmarks_with_logging(img, face_bbox, img_path):
         debug_path = DEBUG_DIR / f"{Path(img_path).stem}_face_region.jpg"
         cv2.imwrite(str(debug_path), face_img)
         logger.info(f"Saved face region: {debug_path}")
-    else:
-        face_img = img
-        offset = (0, 0)
-        logger.info("Using full image for landmark detection")
+        
+        # Try landmark extraction on face region
+        start_time = time.time()
+        fh, fw = face_img.shape[:2]
+        res = mp_mesh.process(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
+        landmark_time = time.time() - start_time
+        
+        logger.info(f"Method 1 (face region) took: {landmark_time:.3f}s")
+        methods_tried.append("face_region")
+        
+        if res.multi_face_landmarks:
+            pts = np.array([[lm.x*fw + offset[0], lm.y*fh + offset[1]] 
+                           for lm in res.multi_face_landmarks[0].landmark])
+            logger.info(f"✅ Method 1: Extracted {len(pts)} landmarks from face region")
+            
+            # Save debug image with landmarks
+            debug_img = img.copy()
+            for pt in pts:
+                cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1)
+            
+            debug_path = DEBUG_DIR / f"{Path(img_path).stem}_landmarks.jpg"
+            cv2.imwrite(str(debug_path), debug_img)
+            logger.info(f"Saved landmarks visualization: {debug_path}")
+            
+            return pts
     
-    # Extract landmarks
+    # Method 2: Try full image with very low confidence
+    logger.info("Method 1 failed, trying full image...")
     start_time = time.time()
-    fh, fw = face_img.shape[:2]
-    res = mp_mesh.process(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
+    
+    # Create a more permissive face mesh detector
+    mp_mesh_fallback = mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=True, 
+        min_detection_confidence=0.05,
+        min_tracking_confidence=0.05,
+        max_num_faces=1
+    )
+    
+    res = mp_mesh_fallback.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     landmark_time = time.time() - start_time
     
-    logger.info(f"Landmark extraction took: {landmark_time:.3f}s")
+    logger.info(f"Method 2 (full image, low confidence) took: {landmark_time:.3f}s")
+    methods_tried.append("full_image_low_confidence")
     
-    if not res.multi_face_landmarks:
-        logger.warning("❌ No landmarks detected in face region")
-        return None
+    if res.multi_face_landmarks:
+        pts = np.array([[lm.x*w, lm.y*h] for lm in res.multi_face_landmarks[0].landmark])
+        logger.info(f"✅ Method 2: Extracted {len(pts)} landmarks from full image")
+        
+        # Save debug image with landmarks
+        debug_img = img.copy()
+        for pt in pts:
+            cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1)
+        
+        debug_path = DEBUG_DIR / f"{Path(img_path).stem}_landmarks.jpg"
+        cv2.imwrite(str(debug_path), debug_img)
+        logger.info(f"Saved landmarks visualization: {debug_path}")
+        
+        return pts
     
-    pts = np.array([[lm.x*fw + offset[0], lm.y*fh + offset[1]] 
-                   for lm in res.multi_face_landmarks[0].landmark])
+    # Method 3: Try with image preprocessing
+    logger.info("Method 2 failed, trying with image enhancement...")
     
-    logger.info(f"✅ Extracted {len(pts)} landmarks")
+    # Enhance contrast and brightness
+    enhanced = cv2.convertScaleAbs(img, alpha=1.2, beta=20)
     
-    # Save debug image with landmarks
-    debug_img = img.copy()
-    for pt in pts:
-        cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1)
+    start_time = time.time()
+    res = mp_mesh_fallback.process(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
+    landmark_time = time.time() - start_time
     
-    debug_path = DEBUG_DIR / f"{Path(img_path).stem}_landmarks.jpg"
-    cv2.imwrite(str(debug_path), debug_img)
-    logger.info(f"Saved landmarks visualization: {debug_path}")
+    logger.info(f"Method 3 (enhanced image) took: {landmark_time:.3f}s")
+    methods_tried.append("enhanced_image")
     
-    return pts
+    if res.multi_face_landmarks:
+        pts = np.array([[lm.x*w, lm.y*h] for lm in res.multi_face_landmarks[0].landmark])
+        logger.info(f"✅ Method 3: Extracted {len(pts)} landmarks from enhanced image")
+        
+        # Save debug image with landmarks
+        debug_img = img.copy()
+        for pt in pts:
+            cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1)
+        
+        debug_path = DEBUG_DIR / f"{Path(img_path).stem}_landmarks.jpg"
+        cv2.imwrite(str(debug_path), debug_img)
+        logger.info(f"Saved landmarks visualization: {debug_path}")
+        
+        return pts
+    
+    logger.warning(f"❌ All methods failed. Tried: {methods_tried}")
+    return None
 
 def create_face_mask(img, landmarks):
     """Create mask of visible face regions (not occluded)"""
@@ -182,10 +244,41 @@ def create_face_mask(img, landmarks):
     
     return combined_mask
 
+def clean_debug_folder():
+    """Clean debug folder before starting"""
+    if DEBUG_DIR.exists():
+        import shutil
+        shutil.rmtree(DEBUG_DIR)
+        logger.info(f"🧹 Cleaned debug folder: {DEBUG_DIR}")
+    DEBUG_DIR.mkdir(exist_ok=True, parents=True)
+
+def get_next_generation_number():
+    """Find next generation number for output files"""
+    existing_files = list(OUT_DIR.glob("generation_*_reconstruction.png"))
+    if not existing_files:
+        return 1
+    
+    numbers = []
+    for f in existing_files:
+        try:
+            num = int(f.stem.split('_')[1])
+            numbers.append(num)
+        except:
+            continue
+    
+    return max(numbers) + 1 if numbers else 1
+
 def main():
     logger.info("🚀 Starting Smart Face Reconstruction Pipeline")
     logger.info(f"Input directory: {RAW_DIR}")
     logger.info(f"Output directory: {OUT_DIR}")
+    
+    # Clean debug folder
+    clean_debug_folder()
+    
+    # Get generation number
+    generation = get_next_generation_number()
+    logger.info(f"📝 Generation: {generation}")
     
     # Find all images
     image_files = sorted(glob.glob(str(RAW_DIR / "*")))
@@ -237,10 +330,10 @@ def main():
         
         stats = {
             'path': img_path,
-            'quality_score': quality_score,
-            'visible_area': visible_area,
-            'face_bbox': face_bbox,
-            'landmarks': landmarks.tolist()
+            'quality_score': float(quality_score),
+            'visible_area': int(visible_area),
+            'face_bbox': [int(x) for x in face_bbox],
+            'landmarks': [[float(x), float(y)] for x, y in landmarks]
         }
         
         valid_images.append((img_path, img, landmarks, face_mask, quality_score))
@@ -248,8 +341,9 @@ def main():
         
         logger.info(f"✅ Successfully processed: {Path(img_path).name}")
     
-    # Save processing stats
-    with open(OUT_DIR / "processing_stats.json", 'w') as f:
+    # Save processing stats with generation number
+    stats_file = OUT_DIR / f"generation_{generation}_stats.json"
+    with open(stats_file, 'w') as f:
         json.dump(processing_stats, f, indent=2)
     
     logger.info(f"\n✅ Phase 1 complete: {len(valid_images)}/{len(image_files)} images processed successfully")
@@ -321,15 +415,20 @@ def main():
     weight_accum[weight_accum == 0] = 1e-6  # Avoid division by zero
     composite = (accum / weight_accum[..., np.newaxis]).astype(np.uint8)
     
-    # Save results
-    output_path = OUT_DIR / "smart_reconstruction.png"
+    # Save results with generation number
+    output_path = OUT_DIR / f"generation_{generation}_reconstruction.png"
     cv2.imwrite(str(output_path), composite)
+    
+    # Also save as latest for convenience
+    latest_path = OUT_DIR / "latest_reconstruction.png"
+    cv2.imwrite(str(latest_path), composite)
     
     logger.info(f"\n🎉 RECONSTRUCTION COMPLETE!")
     logger.info(f"📸 Output saved: {output_path}")
+    logger.info(f"📸 Latest copy: {latest_path}")
     logger.info(f"📊 Used {successful_alignments} images")
     logger.info(f"🔍 Debug files in: {DEBUG_DIR}")
-    logger.info(f"📋 Processing stats: {OUT_DIR}/processing_stats.json")
+    logger.info(f"📋 Processing stats: {stats_file}")
 
 if __name__ == "__main__":
     main()
