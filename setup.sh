@@ -9,8 +9,6 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 # 3-D & vision deps
 pip install opencv-python mediapipe trimesh open3d imageio tqdm Pillow numpy
 
-# PyTorch3D (pre-built wheel for cu118 + Py3.10)
-pip install pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py3.10_cu118_pyt1120/download.html :contentReference[oaicite:0]{index=0}
 
 # DECA
 git clone https://github.com/YadiraF/DECA.git
