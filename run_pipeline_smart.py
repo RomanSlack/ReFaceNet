@@ -250,44 +250,107 @@ def extract_landmarks_with_logging(img, face_bbox, img_path):
     return None
 
 def create_face_mask(img, landmarks):
-    """Create mask of visible face regions focusing on core facial features"""
+    """Create comprehensive face mask to capture full facial region"""
     h, w = img.shape[:2]
     
-    # Create a more conservative face mask using facial feature regions
+    # Start with full convex hull of all landmarks for maximum coverage
+    hull = cv2.convexHull(landmarks.astype(np.int32))
     mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [hull], 255)
     
-    # Get face outline landmarks (more conservative than full convex hull)
+    # Expand the mask outward to capture more of the face
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    
+    # Add specific facial regions to ensure they're included
+    # Forehead region (extend upward from eyebrows)
+    eyebrow_pts = landmarks[[70, 63, 105, 66, 107, 55, 65, 52, 53, 46, 35, 31, 228, 229, 230, 231, 232, 233, 244, 245, 122, 6, 202, 214, 234, 127, 162, 21, 54, 103, 67, 109]]
+    if len(eyebrow_pts) > 0:
+        # Create extended forehead mask
+        forehead_pts = eyebrow_pts.copy()
+        # Extend points upward by 30% of face height
+        face_height = np.max(landmarks[:, 1]) - np.min(landmarks[:, 1])
+        forehead_pts[:, 1] -= face_height * 0.3
+        forehead_hull = cv2.convexHull(forehead_pts.astype(np.int32))
+        cv2.fillPoly(mask, [forehead_hull], 255)
+    
+    # Cheek regions (extend outward from face outline)
     face_outline = landmarks[[10, 151, 9, 8, 168, 6, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]]
+    cheek_pts = face_outline.copy()
+    # Extend cheek points outward
+    face_center = np.mean(landmarks, axis=0)
+    for i, pt in enumerate(cheek_pts):
+        direction = pt - face_center
+        direction = direction / np.linalg.norm(direction)
+        cheek_pts[i] = pt + direction * 20  # Extend by 20 pixels
     
-    # Create face region
-    cv2.fillPoly(mask, [face_outline.astype(np.int32)], 255)
+    cheek_hull = cv2.convexHull(cheek_pts.astype(np.int32))
+    cv2.fillPoly(mask, [cheek_hull], 255)
     
-    # Create separate masks for key facial features
-    # Left eye region
-    left_eye_pts = landmarks[[33, 7, 163, 144, 145, 153, 154, 155, 133]]
-    cv2.fillPoly(mask, [left_eye_pts.astype(np.int32)], 255)
+    # Chin/jaw extension
+    chin_pts = landmarks[[172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361, 323]]
+    if len(chin_pts) > 0:
+        chin_extended = chin_pts.copy() 
+        # Extend chin points downward
+        chin_extended[:, 1] += 25
+        chin_hull = cv2.convexHull(chin_extended.astype(np.int32))
+        cv2.fillPoly(mask, [chin_hull], 255)
     
-    # Right eye region  
-    right_eye_pts = landmarks[[362, 398, 384, 385, 386, 387, 388, 466, 263]]
-    cv2.fillPoly(mask, [right_eye_pts.astype(np.int32)], 255)
-    
-    # Nose region
-    nose_pts = landmarks[[1, 2, 5, 4, 6, 19, 94, 125, 141, 235, 31, 228, 229, 230, 231, 232, 233, 244, 245, 122, 6, 202, 214, 234]]
-    cv2.fillPoly(mask, [nose_pts.astype(np.int32)], 255)
-    
-    # Mouth region
-    mouth_pts = landmarks[[61, 84, 17, 314, 405, 320, 307, 375, 321, 308, 324, 318]]
-    cv2.fillPoly(mask, [mouth_pts.astype(np.int32)], 255)
-    
-    # Smooth the mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    # Clean up the mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     
-    # Apply Gaussian blur for smoother edges
-    mask = cv2.GaussianBlur(mask, (11, 11), 0)
+    # Gentle smoothing for natural edges
+    mask = cv2.GaussianBlur(mask, (7, 7), 0)
     
     return mask
+
+def analyze_face_coverage(mask, landmarks, filename):
+    """Analyze which parts of the face are covered by the mask"""
+    h, w = mask.shape
+    
+    # Define face regions
+    regions = {
+        'left_eye': landmarks[[33, 7, 163, 144, 145, 153, 154, 155, 133]],
+        'right_eye': landmarks[[362, 398, 384, 385, 386, 387, 388, 466, 263]],
+        'nose': landmarks[[1, 2, 5, 4, 6, 19, 94, 125]],
+        'mouth': landmarks[[61, 84, 17, 314, 405, 320, 307, 375]],
+        'left_cheek': landmarks[[116, 117, 118, 119, 120, 121, 126, 142, 36, 205, 206, 207, 213, 192, 147]],
+        'right_cheek': landmarks[[345, 346, 347, 348, 349, 350, 451, 452, 453, 464, 435, 410, 454]],
+        'forehead': landmarks[[10, 151, 9, 8, 168, 6, 148, 176]],
+        'chin': landmarks[[172, 136, 150, 149, 176, 148, 152]]
+    }
+    
+    coverage_stats = {}
+    
+    for region_name, region_landmarks in regions.items():
+        if len(region_landmarks) > 2:
+            # Create region mask
+            region_mask = np.zeros((h, w), dtype=np.uint8)
+            hull = cv2.convexHull(region_landmarks.astype(np.int32))
+            cv2.fillPoly(region_mask, [hull], 255)
+            
+            # Calculate coverage
+            total_region_pixels = np.sum(region_mask > 0)
+            covered_pixels = np.sum((region_mask > 0) & (mask > 0))
+            
+            if total_region_pixels > 0:
+                coverage_percent = (covered_pixels / total_region_pixels) * 100
+                coverage_stats[region_name] = coverage_percent
+            else:
+                coverage_stats[region_name] = 0
+    
+    # Log coverage analysis
+    logger.info(f"Face coverage for {filename}:")
+    for region, coverage in coverage_stats.items():
+        logger.info(f"  {region}: {coverage:.1f}%")
+    
+    # Check for poor coverage areas
+    poor_coverage = [region for region, coverage in coverage_stats.items() if coverage < 50]
+    if poor_coverage:
+        logger.warning(f"  Poor coverage in: {', '.join(poor_coverage)}")
+    
+    return coverage_stats
 
 def normalize_skin_tone(img, mask):
     """Normalize skin tone for consistent color across images"""
@@ -494,6 +557,9 @@ def main():
         logger.info(f"Visible face area: {visible_area} pixels")
         logger.info(f"Final quality score: {quality_score:.3f}")
         
+        # Analyze face coverage
+        analyze_face_coverage(face_mask, landmarks, Path(img_path).stem)
+        
         # Save mask debug
         debug_path = DEBUG_DIR / f"{Path(img_path).stem}_mask.jpg"
         cv2.imwrite(str(debug_path), face_mask)
@@ -626,9 +692,8 @@ def main():
                     else:
                         logger.info(f"✅ Successfully aligned to standard template")
             
-            # Color normalization for consistent skin tones
-            logger.info("Normalizing skin tone...")
-            warped_normalized = normalize_skin_tone(warped_img, warped_mask)
+            # Skip color normalization for now - focus on coverage
+            warped_normalized = warped_img
             
             # Feature-specific weighting system
             visible_ratio = np.sum(warped_mask > 0) / (RES * RES)
@@ -689,6 +754,47 @@ def main():
     weight_accum[weight_accum == 0] = 1e-6  # Avoid division by zero
     composite = (accum / weight_accum[..., np.newaxis]).astype(np.uint8)
     
+    # Analyze final face coverage
+    logger.info("\n=== FINAL FACE COVERAGE ANALYSIS ===")
+    coverage_mask = (weight_accum > np.max(weight_accum) * 0.1).astype(np.uint8) * 255
+    
+    # Save coverage visualization to both debug and main outputs
+    coverage_viz = cv2.applyColorMap(((weight_accum / np.max(weight_accum)) * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    
+    # Save to debug folder
+    cv2.imwrite(str(DEBUG_DIR / "final_coverage_heatmap.jpg"), coverage_viz)
+    cv2.imwrite(str(DEBUG_DIR / "final_coverage_mask.jpg"), coverage_mask)
+    
+    # Save numbered and latest versions to main outputs
+    heatmap_path = OUT_DIR / f"generation_{generation}_heatmap.png"
+    latest_heatmap_path = OUT_DIR / "latest_heatmap.png"
+    
+    cv2.imwrite(str(heatmap_path), coverage_viz)
+    cv2.imwrite(str(latest_heatmap_path), coverage_viz)
+    
+    # Analyze which parts of the standard face template are covered
+    logger.info("Coverage by face region:")
+    
+    # Define regions in the standard template space
+    template_regions = {
+        'left_side': (0, 0, RES//2, RES),           # Left half of image (right side of face)
+        'right_side': (RES//2, 0, RES//2, RES),    # Right half of image (left side of face) 
+        'upper_face': (0, 0, RES, RES//2),         # Upper half (forehead, eyes)
+        'lower_face': (0, RES//2, RES, RES//2),    # Lower half (nose, mouth, chin)
+        'center': (RES//4, RES//4, RES//2, RES//2) # Center region
+    }
+    
+    for region_name, (x, y, w, h) in template_regions.items():
+        region_mask = coverage_mask[y:y+h, x:x+w]
+        total_pixels = w * h
+        covered_pixels = np.sum(region_mask > 0)
+        coverage_percent = (covered_pixels / total_pixels) * 100
+        
+        logger.info(f"  {region_name}: {coverage_percent:.1f}% covered")
+        
+        if coverage_percent < 30:
+            logger.warning(f"  ⚠️ {region_name} has poor coverage!")
+    
     logger.info("Applying advanced post-processing...")
     
     # Multi-stage refinement
@@ -704,16 +810,23 @@ def main():
     logger.info(f"\n🎉 RECONSTRUCTION COMPLETE!")
     logger.info(f"📸 Generation {generation} saved: {output_path}")
     logger.info(f"📸 Latest copy updated: {latest_path}")
+    logger.info(f"🔥 Heatmap saved: {heatmap_path}")
+    logger.info(f"🔥 Latest heatmap: {latest_heatmap_path}")
     logger.info(f"📊 Used {successful_alignments} images")
     logger.info(f"🔍 Debug files in: {DEBUG_DIR}")
     logger.info(f"📋 Processing stats: generation_{generation}_stats.json")
     
     # List previous generations for reference
     prev_generations = sorted(OUT_DIR.glob("generation_*_reconstruction.png"))
+    prev_heatmaps = sorted(OUT_DIR.glob("generation_*_heatmap.png"))
+    
     if len(prev_generations) > 1:
         logger.info(f"📈 Progress tracker: {len(prev_generations)} generations saved")
+        logger.info(f"🔥 Heatmap tracker: {len(prev_heatmaps)} heatmaps saved")
         for gen_file in prev_generations[-3:]:  # Show last 3
             logger.info(f"   {gen_file.name}")
+        for heatmap_file in prev_heatmaps[-3:]:  # Show last 3 heatmaps
+            logger.info(f"   {heatmap_file.name}")
 
 if __name__ == "__main__":
     main()

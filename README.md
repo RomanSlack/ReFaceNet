@@ -2,6 +2,8 @@
 
 ![Latest Reconstruction](outputs/latest_reconstruction.png)
 
+![Latest Coverage Heatmap](outputs/latest_heatmap.png)
+
 ReFaceNet reconstructs a full 3D face from multiple occluded or cropped images of the same person. It intelligently combines visible face parts from different images to create a complete facial reconstruction, handling partial occlusions and cropped photos.
 
 ## How It Works
@@ -43,5 +45,13 @@ python run_pipeline_smart.py
 ## Output Files
 - `generation_X_reconstruction.png` - Numbered results for tracking progress
 - `latest_reconstruction.png` - Always the most recent result
+- `generation_X_heatmap.png` - Numbered coverage heatmaps showing which face regions were reconstructed
+- `latest_heatmap.png` - Always the most recent coverage heatmap
 - `generation_X_stats.json` - Processing statistics for each run
 - `debug/` folder - Individual aligned images and landmark visualizations
+
+## Understanding the Heatmap
+The coverage heatmap shows which parts of the face were successfully reconstructed:
+- **Red/Yellow**: High coverage - multiple input images contributed to this region
+- **Green/Blue**: Medium coverage - some input images contributed  
+- **Dark Blue/Black**: Low/no coverage - few or no input images had visible data for this region
