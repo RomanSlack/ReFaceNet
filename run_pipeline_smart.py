@@ -289,6 +289,126 @@ def create_face_mask(img, landmarks):
     
     return mask
 
+def normalize_skin_tone(img, mask):
+    """Normalize skin tone for consistent color across images"""
+    # Extract skin region using mask
+    skin_pixels = img[mask > 0]
+    
+    if len(skin_pixels) == 0:
+        return img
+    
+    # Calculate current skin tone statistics
+    skin_mean = np.mean(skin_pixels, axis=0)
+    skin_std = np.std(skin_pixels, axis=0)
+    
+    # Target skin tone (neutral warm tone)
+    target_mean = np.array([155, 120, 100], dtype=np.float32)  # BGR
+    target_std = np.array([25, 20, 18], dtype=np.float32)
+    
+    # Apply color transfer to skin regions only
+    normalized = img.copy().astype(np.float32)
+    
+    # Avoid division by zero
+    skin_std = np.maximum(skin_std, 1.0)
+    
+    for c in range(3):
+        # Normalize and shift color channel
+        normalized[:,:,c] = (normalized[:,:,c] - skin_mean[c]) * (target_std[c] / skin_std[c]) + target_mean[c]
+    
+    # Blend normalized version with original using mask
+    mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
+    result = normalized * mask_3ch + img.astype(np.float32) * (1 - mask_3ch)
+    
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+def create_feature_weight_map(mask, landmarks, transform_matrix):
+    """Create weight map that prioritizes important facial features"""
+    h, w = mask.shape
+    weight_map = np.ones((h, w), dtype=np.float32)
+    
+    # Transform landmarks to aligned space
+    landmarks_hom = np.column_stack([landmarks, np.ones(len(landmarks))])
+    transformed_landmarks = (transform_matrix @ landmarks_hom.T).T
+    
+    # Define feature regions with different weights
+    feature_regions = {
+        'eyes': {'landmarks': [33, 7, 163, 144, 145, 153, 154, 155, 133, 362, 398, 384, 385, 386, 387, 388, 466, 263], 'weight': 1.5},
+        'nose': {'landmarks': [1, 2, 5, 4, 6, 19, 94, 125], 'weight': 1.3},  
+        'mouth': {'landmarks': [61, 84, 17, 314, 405, 320, 307, 375], 'weight': 1.4},
+        'eyebrows': {'landmarks': [70, 63, 105, 66, 107, 55, 65, 52, 53, 46], 'weight': 1.2}
+    }
+    
+    for feature_name, feature_info in feature_regions.items():
+        try:
+            # Get transformed landmark points for this feature
+            feature_landmarks = transformed_landmarks[feature_info['landmarks']]
+            
+            # Create convex hull around feature
+            if len(feature_landmarks) > 2:
+                hull = cv2.convexHull(feature_landmarks.astype(np.int32))
+                feature_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(feature_mask, [hull], 1)
+                
+                # Apply feature weight
+                weight_map += feature_mask * (feature_info['weight'] - 1.0)
+        except:
+            continue  # Skip if landmarks are invalid
+    
+    return weight_map
+
+def apply_advanced_post_processing(composite, weight_map):
+    """Advanced post-processing pipeline for final image refinement"""
+    logger.info("Stage 1: Edge smoothing and blending...")
+    
+    # Create confidence mask from weight accumulation
+    confidence_mask = np.clip(weight_map / np.max(weight_map), 0, 1)
+    
+    # Edge detection for transition smoothing
+    edge_mask = cv2.Canny((confidence_mask * 255).astype(np.uint8), 30, 100)
+    edge_mask = cv2.dilate(edge_mask, np.ones((3,3), np.uint8), iterations=2)
+    edge_mask = cv2.GaussianBlur(edge_mask, (5,5), 0) / 255.0
+    
+    # Bilateral filter for noise reduction while preserving edges
+    denoised = cv2.bilateralFilter(composite, 9, 75, 75)
+    
+    # Blend denoised version at low-confidence edges
+    edge_mask_3ch = cv2.cvtColor((edge_mask * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR) / 255.0
+    refined = composite.astype(np.float32) * (1 - edge_mask_3ch) + denoised.astype(np.float32) * edge_mask_3ch
+    
+    logger.info("Stage 2: Color and contrast enhancement...")
+    
+    # Adaptive histogram equalization for better contrast
+    lab = cv2.cvtColor(refined.astype(np.uint8), cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    lab[:,:,0] = clahe.apply(lab[:,:,0])
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    
+    # Subtle color balance adjustment
+    enhanced = cv2.convertScaleAbs(enhanced, alpha=1.05, beta=3)
+    
+    logger.info("Stage 3: Detail enhancement...")
+    
+    # Multi-scale unsharp masking for better detail
+    # Fine details
+    gaussian_fine = cv2.GaussianBlur(enhanced, (0, 0), 0.8)
+    enhanced = cv2.addWeighted(enhanced, 1.3, gaussian_fine, -0.3, 0)
+    
+    # Medium details  
+    gaussian_medium = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
+    enhanced = cv2.addWeighted(enhanced, 1.15, gaussian_medium, -0.15, 0)
+    
+    logger.info("Stage 4: Final skin smoothing...")
+    
+    # Gentle skin smoothing in low-confidence areas
+    low_conf_mask = (confidence_mask < 0.7).astype(np.float32)
+    smoothed = cv2.bilateralFilter(enhanced, 15, 80, 80)
+    
+    # Apply skin smoothing only where confidence is low
+    low_conf_mask_3ch = cv2.cvtColor((low_conf_mask * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR) / 255.0
+    final = enhanced.astype(np.float32) * (1 - low_conf_mask_3ch * 0.4) + smoothed.astype(np.float32) * (low_conf_mask_3ch * 0.4)
+    
+    return np.clip(final, 0, 255).astype(np.uint8)
+
 def clean_debug_folder():
     """Clean debug folder before starting"""
     if DEBUG_DIR.exists():
@@ -506,36 +626,55 @@ def main():
                     else:
                         logger.info(f"✅ Successfully aligned to standard template")
             
-            # Advanced weighting system
+            # Color normalization for consistent skin tones
+            logger.info("Normalizing skin tone...")
+            warped_normalized = normalize_skin_tone(warped_img, warped_mask)
+            
+            # Feature-specific weighting system
             visible_ratio = np.sum(warped_mask > 0) / (RES * RES)
+            
+            # Create feature-specific weight maps
+            feature_weights = create_feature_weight_map(warped_mask, landmarks, M)
             
             # Base weight from quality and visible area
             base_weight = quality_score * visible_ratio
             
             # Boost weight for images with unique visible regions
-            overlap_penalty = 1.0
+            novelty_bonus = 1.0
             if successful_alignments > 0:
                 # Calculate overlap with existing composite
                 existing_mask = (weight_accum > 0).astype(np.float32)
                 new_mask = (warped_mask > 0).astype(np.float32)
                 overlap = np.sum(existing_mask * new_mask) / max(np.sum(new_mask), 1)
-                overlap_penalty = 1.0 + (1.0 - overlap) * 0.5  # Bonus for non-overlapping regions
+                novelty_bonus = 1.0 + (1.0 - overlap) * 0.6  # Higher bonus for unique regions
             
-            final_weight = base_weight * overlap_penalty
+            final_weight = base_weight * novelty_bonus
             
-            # Adaptive mask blending - softer edges for better integration
-            mask_norm = warped_mask.astype(np.float32) / 255.0
-            # Apply Gaussian blur to mask for smoother blending
-            mask_norm = cv2.GaussianBlur(mask_norm, (9, 9), 2.0)
-            weight_map = mask_norm * final_weight
+            # Multi-scale blending for better detail preservation
+            logger.info("Applying multi-scale blending...")
             
-            accum += warped_img.astype(np.float32) * weight_map[..., np.newaxis]
-            weight_accum += weight_map
+            # Create pyramid of masks for different detail levels
+            mask_blur_light = cv2.GaussianBlur(warped_mask.astype(np.float32) / 255.0, (5, 5), 1.0)
+            mask_blur_medium = cv2.GaussianBlur(warped_mask.astype(np.float32) / 255.0, (11, 11), 2.5)
+            mask_blur_heavy = cv2.GaussianBlur(warped_mask.astype(np.float32) / 255.0, (21, 21), 5.0)
+            
+            # Weight maps for different scales
+            detail_weight = mask_blur_light * final_weight * feature_weights
+            medium_weight = mask_blur_medium * final_weight * 0.8
+            base_weight_map = mask_blur_heavy * final_weight * 0.6
+            
+            # Accumulate at different scales
+            accum += warped_normalized.astype(np.float32) * detail_weight[..., np.newaxis] * 0.6
+            accum += warped_normalized.astype(np.float32) * medium_weight[..., np.newaxis] * 0.3  
+            accum += warped_normalized.astype(np.float32) * base_weight_map[..., np.newaxis] * 0.1
+            
+            weight_accum += detail_weight * 0.6 + medium_weight * 0.3 + base_weight_map * 0.1
             
             successful_alignments += 1
             logger.info(f"✅ Added to composite:")
-            logger.info(f"    Base weight: {base_weight:.3f}, Overlap penalty: {overlap_penalty:.2f}")
-            logger.info(f"    Final weight: {final_weight:.3f}, Brightness: {np.mean(warped_img):.1f}")
+            logger.info(f"    Base weight: {base_weight:.3f}, Novelty bonus: {novelty_bonus:.2f}")
+            logger.info(f"    Final weight: {final_weight:.3f}, Brightness: {np.mean(warped_normalized):.1f}")
+            logger.info(f"    Feature weights: {np.mean(feature_weights):.2f}, Multi-scale blending applied")
             
             # Save debug warped image
             debug_path = DEBUG_DIR / f"{Path(img_path).stem}_warped.jpg"
@@ -546,33 +685,14 @@ def main():
     
     logger.info(f"\n✅ Successfully aligned {successful_alignments} images")
     
-    # Generate final composite with improved blending
+    # Generate final composite with advanced blending
     weight_accum[weight_accum == 0] = 1e-6  # Avoid division by zero
     composite = (accum / weight_accum[..., np.newaxis]).astype(np.uint8)
     
-    # Apply edge smoothing to reduce harsh transitions
-    logger.info("Applying edge smoothing...")
+    logger.info("Applying advanced post-processing...")
     
-    # Create edge mask to identify transition areas
-    edge_mask = cv2.Canny((weight_accum * 255).astype(np.uint8), 50, 150)
-    edge_mask = cv2.dilate(edge_mask, np.ones((5,5), np.uint8), iterations=2)
-    
-    # Apply Gaussian blur only to edge areas for smoother transitions
-    blurred = cv2.GaussianBlur(composite, (7, 7), 0)
-    edge_mask_3ch = cv2.cvtColor(edge_mask, cv2.COLOR_GRAY2BGR) / 255.0
-    
-    # Blend original with blurred version at edges
-    composite = (composite * (1 - edge_mask_3ch) + blurred * edge_mask_3ch).astype(np.uint8)
-    
-    # Enhance contrast and sharpness slightly
-    logger.info("Enhancing final image...")
-    
-    # Mild contrast enhancement
-    composite = cv2.convertScaleAbs(composite, alpha=1.1, beta=5)
-    
-    # Unsharp mask for subtle sharpening
-    gaussian = cv2.GaussianBlur(composite, (0, 0), 2.0)
-    composite = cv2.addWeighted(composite, 1.5, gaussian, -0.5, 0)
+    # Multi-stage refinement
+    composite = apply_advanced_post_processing(composite, weight_accum)
     
     # Save results with generation number and latest copy
     output_path = OUT_DIR / f"generation_{generation}_reconstruction.png"
