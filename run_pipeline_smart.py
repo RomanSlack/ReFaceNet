@@ -33,19 +33,54 @@ mp_mesh = mp.solutions.face_mesh.FaceMesh(
     max_num_faces=1
 )
 
-def analyze_image_quality(img):
-    """Analyze image for face reconstruction quality"""
+def analyze_image_quality(img, face_bbox=None):
+    """Advanced image quality analysis for face reconstruction"""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Calculate metrics
-    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()  # Sharpness
-    brightness = np.mean(gray)
-    contrast = np.std(gray)
+    # Focus on face region if available
+    if face_bbox:
+        x, y, w, h = face_bbox
+        face_gray = gray[y:y+h, x:x+w]
+        face_color = img[y:y+h, x:x+w]
+    else:
+        face_gray = gray
+        face_color = img
     
-    quality_score = (laplacian_var / 100) + (contrast / 50) + (1 - abs(brightness - 127) / 127)
+    # Calculate multiple quality metrics
+    laplacian_var = cv2.Laplacian(face_gray, cv2.CV_64F).var()  # Sharpness
+    brightness = np.mean(face_gray)
+    contrast = np.std(face_gray)
     
-    logger.info(f"   Sharpness: {laplacian_var:.1f}, Brightness: {brightness:.1f}, Contrast: {contrast:.1f}")
-    logger.info(f"   Quality Score: {quality_score:.2f}")
+    # Additional quality metrics
+    # Texture richness (gradient magnitude)
+    grad_x = cv2.Sobel(face_gray, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(face_gray, cv2.CV_64F, 0, 1, ksize=3)
+    gradient_mag = np.sqrt(grad_x**2 + grad_y**2)
+    texture_score = np.mean(gradient_mag)
+    
+    # Color saturation in face region
+    hsv = cv2.cvtColor(face_color, cv2.COLOR_BGR2HSV)
+    saturation = np.mean(hsv[:,:,1])
+    
+    # Exposure quality (avoid over/under-exposed)
+    exposure_score = 1.0 - (np.sum(face_gray > 240) + np.sum(face_gray < 15)) / face_gray.size
+    
+    # Combined quality score with weights
+    quality_score = (
+        (laplacian_var / 200) * 0.3 +      # Sharpness (30%)
+        (texture_score / 50) * 0.25 +      # Texture detail (25%)
+        (contrast / 80) * 0.2 +            # Contrast (20%)
+        exposure_score * 0.15 +            # Exposure (15%)
+        (saturation / 100) * 0.1           # Color richness (10%)
+    )
+    
+    # Penalty for extreme brightness
+    brightness_penalty = abs(brightness - 127) / 127
+    quality_score *= (1 - brightness_penalty * 0.3)
+    
+    logger.info(f"   Sharpness: {laplacian_var:.1f}, Texture: {texture_score:.1f}, Contrast: {contrast:.1f}")
+    logger.info(f"   Brightness: {brightness:.1f}, Saturation: {saturation:.1f}, Exposure: {exposure_score:.2f}")
+    logger.info(f"   Quality Score: {quality_score:.3f}")
     
     return quality_score
 
@@ -56,7 +91,7 @@ def detect_face_with_logging(img, img_path):
     
     h, w = img.shape[:2]
     
-    # Analyze image quality
+    # Analyze image quality (will be updated with face_bbox later)
     quality_score = analyze_image_quality(img)
     
     # Try face detection
@@ -328,11 +363,16 @@ def main():
             logger.warning(f"Skipping {Path(img_path).name} - no landmarks")
             continue
         
+        # Re-analyze quality focusing on detected face region
+        if face_bbox:
+            quality_score = analyze_image_quality(img, face_bbox)
+        
         # Create face mask
         face_mask = create_face_mask(img, landmarks)
         visible_area = np.sum(face_mask > 0)
         
         logger.info(f"Visible face area: {visible_area} pixels")
+        logger.info(f"Final quality score: {quality_score:.3f}")
         
         # Save mask debug
         debug_path = DEBUG_DIR / f"{Path(img_path).stem}_mask.jpg"
@@ -456,18 +496,36 @@ def main():
                             else:
                                 logger.info(f"✅ Successfully warped {Path(img_path).name}")
             
-            # Weight by quality and visible area
-            weight = quality_score * (np.sum(warped_mask > 0) / (RES * RES))
+            # Advanced weighting system
+            visible_ratio = np.sum(warped_mask > 0) / (RES * RES)
             
-            # Accumulate with weights
+            # Base weight from quality and visible area
+            base_weight = quality_score * visible_ratio
+            
+            # Boost weight for images with unique visible regions
+            overlap_penalty = 1.0
+            if successful_alignments > 0:
+                # Calculate overlap with existing composite
+                existing_mask = (weight_accum > 0).astype(np.float32)
+                new_mask = (warped_mask > 0).astype(np.float32)
+                overlap = np.sum(existing_mask * new_mask) / max(np.sum(new_mask), 1)
+                overlap_penalty = 1.0 + (1.0 - overlap) * 0.5  # Bonus for non-overlapping regions
+            
+            final_weight = base_weight * overlap_penalty
+            
+            # Adaptive mask blending - softer edges for better integration
             mask_norm = warped_mask.astype(np.float32) / 255.0
-            weight_map = mask_norm * weight
+            # Apply Gaussian blur to mask for smoother blending
+            mask_norm = cv2.GaussianBlur(mask_norm, (9, 9), 2.0)
+            weight_map = mask_norm * final_weight
             
             accum += warped_img.astype(np.float32) * weight_map[..., np.newaxis]
             weight_accum += weight_map
             
             successful_alignments += 1
-            logger.info(f"✅ Added to composite with weight: {weight:.3f}, mean brightness: {np.mean(warped_img):.1f}")
+            logger.info(f"✅ Added to composite:")
+            logger.info(f"    Base weight: {base_weight:.3f}, Overlap penalty: {overlap_penalty:.2f}")
+            logger.info(f"    Final weight: {final_weight:.3f}, Brightness: {np.mean(warped_img):.1f}")
             
             # Save debug warped image
             debug_path = DEBUG_DIR / f"{Path(img_path).stem}_warped.jpg"
@@ -478,24 +536,54 @@ def main():
     
     logger.info(f"\n✅ Successfully aligned {successful_alignments} images")
     
-    # Generate final composite
+    # Generate final composite with improved blending
     weight_accum[weight_accum == 0] = 1e-6  # Avoid division by zero
     composite = (accum / weight_accum[..., np.newaxis]).astype(np.uint8)
     
-    # Save results with generation number
-    output_path = OUT_DIR / f"generation_{generation}_reconstruction.png"
-    cv2.imwrite(str(output_path), composite)
+    # Apply edge smoothing to reduce harsh transitions
+    logger.info("Applying edge smoothing...")
     
-    # Also save as latest for convenience
+    # Create edge mask to identify transition areas
+    edge_mask = cv2.Canny((weight_accum * 255).astype(np.uint8), 50, 150)
+    edge_mask = cv2.dilate(edge_mask, np.ones((5,5), np.uint8), iterations=2)
+    
+    # Apply Gaussian blur only to edge areas for smoother transitions
+    blurred = cv2.GaussianBlur(composite, (7, 7), 0)
+    edge_mask_3ch = cv2.cvtColor(edge_mask, cv2.COLOR_GRAY2BGR) / 255.0
+    
+    # Blend original with blurred version at edges
+    composite = (composite * (1 - edge_mask_3ch) + blurred * edge_mask_3ch).astype(np.uint8)
+    
+    # Enhance contrast and sharpness slightly
+    logger.info("Enhancing final image...")
+    
+    # Mild contrast enhancement
+    composite = cv2.convertScaleAbs(composite, alpha=1.1, beta=5)
+    
+    # Unsharp mask for subtle sharpening
+    gaussian = cv2.GaussianBlur(composite, (0, 0), 2.0)
+    composite = cv2.addWeighted(composite, 1.5, gaussian, -0.5, 0)
+    
+    # Save results with generation number and latest copy
+    output_path = OUT_DIR / f"generation_{generation}_reconstruction.png"
     latest_path = OUT_DIR / "latest_reconstruction.png"
+    
+    cv2.imwrite(str(output_path), composite)
     cv2.imwrite(str(latest_path), composite)
     
     logger.info(f"\n🎉 RECONSTRUCTION COMPLETE!")
-    logger.info(f"📸 Output saved: {output_path}")
-    logger.info(f"📸 Latest copy: {latest_path}")
+    logger.info(f"📸 Generation {generation} saved: {output_path}")
+    logger.info(f"📸 Latest copy updated: {latest_path}")
     logger.info(f"📊 Used {successful_alignments} images")
     logger.info(f"🔍 Debug files in: {DEBUG_DIR}")
-    logger.info(f"📋 Processing stats: {stats_file}")
+    logger.info(f"📋 Processing stats: generation_{generation}_stats.json")
+    
+    # List previous generations for reference
+    prev_generations = sorted(OUT_DIR.glob("generation_*_reconstruction.png"))
+    if len(prev_generations) > 1:
+        logger.info(f"📈 Progress tracker: {len(prev_generations)} generations saved")
+        for gen_file in prev_generations[-3:]:  # Show last 3
+            logger.info(f"   {gen_file.name}")
 
 if __name__ == "__main__":
     main()
