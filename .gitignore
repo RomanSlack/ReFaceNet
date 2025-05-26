@@ -8,7 +8,10 @@ yarn-debug.log*
 yarn-error.log*
 
 /data
-/outputs
+/outputs/debug
+
+
+
 # Environment files
 .env
 .env.local

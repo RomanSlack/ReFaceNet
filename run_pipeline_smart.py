@@ -215,34 +215,44 @@ def extract_landmarks_with_logging(img, face_bbox, img_path):
     return None
 
 def create_face_mask(img, landmarks):
-    """Create mask of visible face regions (not occluded)"""
+    """Create mask of visible face regions focusing on core facial features"""
     h, w = img.shape[:2]
     
-    # Create convex hull of face landmarks
-    hull = cv2.convexHull(landmarks.astype(np.int32))
+    # Create a more conservative face mask using facial feature regions
     mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask, [hull], 255)
     
-    # Remove occluded regions by analyzing color/texture
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Get face outline landmarks (more conservative than full convex hull)
+    face_outline = landmarks[[10, 151, 9, 8, 168, 6, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]]
     
-    # Detect skin-like regions (simple method)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    # Create face region
+    cv2.fillPoly(mask, [face_outline.astype(np.int32)], 255)
     
-    # Skin color range (adjust as needed)
-    lower_skin = np.array([0, 30, 50])
-    upper_skin = np.array([25, 255, 255])
-    skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+    # Create separate masks for key facial features
+    # Left eye region
+    left_eye_pts = landmarks[[33, 7, 163, 144, 145, 153, 154, 155, 133]]
+    cv2.fillPoly(mask, [left_eye_pts.astype(np.int32)], 255)
     
-    # Combine face hull with skin detection
-    combined_mask = cv2.bitwise_and(mask, skin_mask)
+    # Right eye region  
+    right_eye_pts = landmarks[[362, 398, 384, 385, 386, 387, 388, 466, 263]]
+    cv2.fillPoly(mask, [right_eye_pts.astype(np.int32)], 255)
     
-    # Morphological operations to clean up
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
-    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+    # Nose region
+    nose_pts = landmarks[[1, 2, 5, 4, 6, 19, 94, 125, 141, 235, 31, 228, 229, 230, 231, 232, 233, 244, 245, 122, 6, 202, 214, 234]]
+    cv2.fillPoly(mask, [nose_pts.astype(np.int32)], 255)
     
-    return combined_mask
+    # Mouth region
+    mouth_pts = landmarks[[61, 84, 17, 314, 405, 320, 307, 375, 321, 308, 324, 318]]
+    cv2.fillPoly(mask, [mouth_pts.astype(np.int32)], 255)
+    
+    # Smooth the mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    
+    # Apply Gaussian blur for smoother edges
+    mask = cv2.GaussianBlur(mask, (11, 11), 0)
+    
+    return mask
 
 def clean_debug_folder():
     """Clean debug folder before starting"""
@@ -363,9 +373,18 @@ def main():
     
     logger.info(f"Using template: {Path(template_path).name}")
     
-    # Key landmarks for alignment (eyes, nose, mouth corners)
-    key_indices = [33, 133, 362, 263, 1, 61, 291, 17]
+    # Better landmark selection for stable face alignment
+    # Eyes: inner and outer corners
+    left_eye = [133, 33]    # left eye outer, inner corner
+    right_eye = [362, 263]  # right eye inner, outer corner  
+    nose_tip = [1]          # nose tip
+    mouth = [61, 291]       # mouth corners
+    
+    key_indices = left_eye + right_eye + nose_tip + mouth
     template_key_points = template_landmarks[key_indices]
+    
+    logger.info(f"Template key points shape: {template_key_points.shape}")
+    logger.info(f"Eye distance: {np.linalg.norm(template_key_points[0] - template_key_points[2]):.1f}px")
     
     # Initialize accumulation
     accum = np.zeros((RES, RES, 3), np.float32)
@@ -379,15 +398,63 @@ def main():
         try:
             # Align using key landmarks
             src_points = landmarks[key_indices]
-            M, _ = cv2.estimateAffinePartial2D(src_points, template_key_points)
             
-            if M is None:
-                logger.warning(f"❌ Failed to compute alignment for {Path(img_path).name}")
+            # Validate points before alignment
+            if len(src_points) < 4:
+                logger.warning(f"❌ Not enough key points for {Path(img_path).name}")
                 continue
-            
-            # Warp image and mask
-            warped_img = cv2.warpAffine(img, M, (RES, RES))
-            warped_mask = cv2.warpAffine(face_mask, M, (RES, RES))
+                
+            # Check for valid point spread
+            point_spread = np.std(src_points, axis=0)
+            if np.any(point_spread < 20):  # Increased threshold for better stability
+                logger.warning(f"❌ Points too close together for {Path(img_path).name}")
+                warped_img = cv2.resize(img, (RES, RES))
+                warped_mask = cv2.resize(face_mask, (RES, RES))
+                logger.info(f"🔄 Using resize fallback due to point spread")
+            else:
+                # Calculate eye distance for this image to check if reasonable
+                eye_dist_src = np.linalg.norm(src_points[0] - src_points[2])
+                eye_dist_template = np.linalg.norm(template_key_points[0] - template_key_points[2])
+                scale_ratio = eye_dist_src / eye_dist_template
+                
+                logger.info(f"Eye distance ratio: {scale_ratio:.2f}")
+                
+                # Only use transformation if scale ratio is reasonable
+                if scale_ratio < 0.3 or scale_ratio > 3.0:
+                    logger.warning(f"❌ Unreasonable scale ratio for {Path(img_path).name}")
+                    warped_img = cv2.resize(img, (RES, RES))
+                    warped_mask = cv2.resize(face_mask, (RES, RES))
+                    logger.info(f"🔄 Using resize fallback due to scale ratio")
+                else:
+                    # Try similarity transform (only scale, rotation, translation - no shear)
+                    M, _ = cv2.estimateAffinePartial2D(src_points, template_key_points)
+                    
+                    if M is None:
+                        logger.warning(f"❌ Failed to compute alignment for {Path(img_path).name}")
+                        warped_img = cv2.resize(img, (RES, RES))
+                        warped_mask = cv2.resize(face_mask, (RES, RES))
+                        logger.info(f"🔄 Using resize fallback - no matrix")
+                    else:
+                        # Validate transformation matrix
+                        det = np.linalg.det(M[:2, :2])
+                        if abs(det) < 0.3 or abs(det) > 3.0:  # Stricter bounds
+                            logger.warning(f"❌ Invalid transformation matrix det={det:.2f} for {Path(img_path).name}")
+                            warped_img = cv2.resize(img, (RES, RES))
+                            warped_mask = cv2.resize(face_mask, (RES, RES))
+                            logger.info(f"🔄 Using resize fallback - bad matrix")
+                        else:
+                            # Warp image and mask
+                            warped_img = cv2.warpAffine(img, M, (RES, RES))
+                            warped_mask = cv2.warpAffine(face_mask, M, (RES, RES))
+                            
+                            # Check if warp result is valid (not black)
+                            if np.mean(warped_img) < 20:
+                                logger.warning(f"❌ Warped image too dark for {Path(img_path).name}")
+                                warped_img = cv2.resize(img, (RES, RES))
+                                warped_mask = cv2.resize(face_mask, (RES, RES))
+                                logger.info(f"🔄 Using resize fallback - dark result")
+                            else:
+                                logger.info(f"✅ Successfully warped {Path(img_path).name}")
             
             # Weight by quality and visible area
             weight = quality_score * (np.sum(warped_mask > 0) / (RES * RES))
@@ -400,7 +467,7 @@ def main():
             weight_accum += weight_map
             
             successful_alignments += 1
-            logger.info(f"✅ Aligned with weight: {weight:.3f}")
+            logger.info(f"✅ Added to composite with weight: {weight:.3f}, mean brightness: {np.mean(warped_img):.1f}")
             
             # Save debug warped image
             debug_path = DEBUG_DIR / f"{Path(img_path).stem}_warped.jpg"
