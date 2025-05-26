@@ -413,18 +413,26 @@ def main():
     
     logger.info(f"Using template: {Path(template_path).name}")
     
-    # Better landmark selection for stable face alignment
-    # Eyes: inner and outer corners
-    left_eye = [133, 33]    # left eye outer, inner corner
-    right_eye = [362, 263]  # right eye inner, outer corner  
-    nose_tip = [1]          # nose tip
-    mouth = [61, 291]       # mouth corners
+    # Completely new approach: standardized face template
+    # Define a standard face template with normalized positions
+    template_size = RES
     
-    key_indices = left_eye + right_eye + nose_tip + mouth
-    template_key_points = template_landmarks[key_indices]
+    # Standard face proportions (normalized to template_size)
+    eye_y = template_size * 0.35  # Eyes at 35% from top
+    eye_spacing = template_size * 0.25  # Eye spacing
+    center_x = template_size * 0.5
     
-    logger.info(f"Template key points shape: {template_key_points.shape}")
-    logger.info(f"Eye distance: {np.linalg.norm(template_key_points[0] - template_key_points[2]):.1f}px")
+    # Standard template points
+    standard_template = np.array([
+        [center_x - eye_spacing/2, eye_y],  # Left eye center
+        [center_x + eye_spacing/2, eye_y],  # Right eye center  
+        [center_x, template_size * 0.55],   # Nose tip
+        [center_x - template_size*0.15, template_size * 0.75],  # Left mouth corner
+        [center_x + template_size*0.15, template_size * 0.75],  # Right mouth corner
+    ], dtype=np.float32)
+    
+    logger.info(f"Using standardized face template")
+    logger.info(f"Template eye distance: {np.linalg.norm(standard_template[0] - standard_template[1]):.1f}px")
     
     # Initialize accumulation
     accum = np.zeros((RES, RES, 3), np.float32)
@@ -436,65 +444,67 @@ def main():
         logger.info(f"\nAligning image {i+1}: {Path(img_path).name}")
         
         try:
-            # Align using key landmarks
-            src_points = landmarks[key_indices]
+            # Extract key facial points from landmarks
+            # Left eye center (average of eye landmarks)
+            left_eye_pts = landmarks[[33, 7, 163, 144, 145, 153, 154, 155, 133]]
+            left_eye_center = np.mean(left_eye_pts, axis=0)
             
-            # Validate points before alignment
-            if len(src_points) < 4:
-                logger.warning(f"❌ Not enough key points for {Path(img_path).name}")
-                continue
-                
-            # Check for valid point spread
-            point_spread = np.std(src_points, axis=0)
-            if np.any(point_spread < 20):  # Increased threshold for better stability
-                logger.warning(f"❌ Points too close together for {Path(img_path).name}")
+            # Right eye center  
+            right_eye_pts = landmarks[[362, 398, 384, 385, 386, 387, 388, 466, 263]]
+            right_eye_center = np.mean(right_eye_pts, axis=0)
+            
+            # Nose tip
+            nose_tip = landmarks[1]
+            
+            # Mouth corners
+            left_mouth = landmarks[61]
+            right_mouth = landmarks[291]
+            
+            # Create source points array
+            src_points = np.array([
+                left_eye_center,
+                right_eye_center, 
+                nose_tip,
+                left_mouth,
+                right_mouth
+            ], dtype=np.float32)
+            
+            logger.info(f"Extracted facial key points")
+            logger.info(f"Eye distance: {np.linalg.norm(left_eye_center - right_eye_center):.1f}px")
+            
+            # Align to standard template using similarity transform
+            M, _ = cv2.estimateAffinePartial2D(src_points, standard_template)
+            
+            if M is None:
+                logger.warning(f"❌ Failed to compute alignment for {Path(img_path).name}")
                 warped_img = cv2.resize(img, (RES, RES))
                 warped_mask = cv2.resize(face_mask, (RES, RES))
-                logger.info(f"🔄 Using resize fallback due to point spread")
+                logger.info(f"🔄 Using resize fallback - no alignment matrix")
             else:
-                # Calculate eye distance for this image to check if reasonable
-                eye_dist_src = np.linalg.norm(src_points[0] - src_points[2])
-                eye_dist_template = np.linalg.norm(template_key_points[0] - template_key_points[2])
-                scale_ratio = eye_dist_src / eye_dist_template
+                # Check transformation sanity
+                det = np.linalg.det(M[:2, :2])
+                scale = np.sqrt(det)
                 
-                logger.info(f"Eye distance ratio: {scale_ratio:.2f}")
+                logger.info(f"Transform scale: {scale:.2f}, determinant: {det:.2f}")
                 
-                # Only use transformation if scale ratio is reasonable
-                if scale_ratio < 0.3 or scale_ratio > 3.0:
-                    logger.warning(f"❌ Unreasonable scale ratio for {Path(img_path).name}")
+                if scale < 0.2 or scale > 5.0:
+                    logger.warning(f"❌ Extreme scaling detected for {Path(img_path).name}")
                     warped_img = cv2.resize(img, (RES, RES))
                     warped_mask = cv2.resize(face_mask, (RES, RES))
-                    logger.info(f"🔄 Using resize fallback due to scale ratio")
+                    logger.info(f"🔄 Using resize fallback - extreme scale")
                 else:
-                    # Try similarity transform (only scale, rotation, translation - no shear)
-                    M, _ = cv2.estimateAffinePartial2D(src_points, template_key_points)
+                    # Apply transformation
+                    warped_img = cv2.warpAffine(img, M, (RES, RES))
+                    warped_mask = cv2.warpAffine(face_mask, M, (RES, RES))
                     
-                    if M is None:
-                        logger.warning(f"❌ Failed to compute alignment for {Path(img_path).name}")
+                    # Validate result
+                    if np.mean(warped_img) < 15:
+                        logger.warning(f"❌ Warped result too dark for {Path(img_path).name}")
                         warped_img = cv2.resize(img, (RES, RES))
                         warped_mask = cv2.resize(face_mask, (RES, RES))
-                        logger.info(f"🔄 Using resize fallback - no matrix")
+                        logger.info(f"🔄 Using resize fallback - dark result")
                     else:
-                        # Validate transformation matrix
-                        det = np.linalg.det(M[:2, :2])
-                        if abs(det) < 0.3 or abs(det) > 3.0:  # Stricter bounds
-                            logger.warning(f"❌ Invalid transformation matrix det={det:.2f} for {Path(img_path).name}")
-                            warped_img = cv2.resize(img, (RES, RES))
-                            warped_mask = cv2.resize(face_mask, (RES, RES))
-                            logger.info(f"🔄 Using resize fallback - bad matrix")
-                        else:
-                            # Warp image and mask
-                            warped_img = cv2.warpAffine(img, M, (RES, RES))
-                            warped_mask = cv2.warpAffine(face_mask, M, (RES, RES))
-                            
-                            # Check if warp result is valid (not black)
-                            if np.mean(warped_img) < 20:
-                                logger.warning(f"❌ Warped image too dark for {Path(img_path).name}")
-                                warped_img = cv2.resize(img, (RES, RES))
-                                warped_mask = cv2.resize(face_mask, (RES, RES))
-                                logger.info(f"🔄 Using resize fallback - dark result")
-                            else:
-                                logger.info(f"✅ Successfully warped {Path(img_path).name}")
+                        logger.info(f"✅ Successfully aligned to standard template")
             
             # Advanced weighting system
             visible_ratio = np.sum(warped_mask > 0) / (RES * RES)
