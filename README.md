@@ -4,20 +4,22 @@
 
 ![Latest Coverage Heatmap](outputs/latest_heatmap.png)
 
-ReFaceNet reconstructs a full 3D face from multiple occluded or cropped images of the same person. It intelligently combines visible face parts from different images to create a complete facial reconstruction, handling partial occlusions and cropped photos.
+ReFaceNet reconstructs a complete 2D face from multiple occluded or cropped images of the same person. It intelligently combines visible face parts from different images to create a unified facial reconstruction, handling partial occlusions, hand-covered faces, and cropped photos.
 
 ## How It Works
 - **Smart Face Detection**: Detects faces even when partially occluded by hands or objects
-- **Landmark Alignment**: Uses facial landmarks to align images geometrically  
-- **Intelligent Blending**: Combines the best visible parts from each input image
+- **Standardized Alignment**: Aligns all faces to a common template for consistent geometry
+- **Multi-Scale Blending**: Combines visible regions at different detail levels for natural results
+- **Coverage Analysis**: Tracks which facial regions are reconstructed vs missing
 - **Quality Weighting**: Prioritizes clearer, higher-quality facial regions
 
-## Latest Features
-- Multi-method landmark detection with fallbacks
-- Robust alignment validation to prevent distortions
-- Feature-specific face masking (eyes, nose, mouth)
-- Comprehensive logging and debugging output
-- Automatic generation numbering for tracking improvements
+## Key Features
+- **2D Face Reconstruction**: Complete facial images from partial inputs
+- **Occlusion Handling**: Works with hand-covered selfies and cropped photos
+- **Multi-method landmark detection** with robust fallbacks
+- **Feature-specific face masking** (eyes, nose, mouth, cheeks, forehead)
+- **Real-time coverage heatmaps** showing reconstruction quality
+- **Generation tracking** for iterative improvements
 
 ## Quick Start
 
